@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Free AI Story-to-Video Generator</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js"></script>
+<!-- FFmpeg.wasm (UMD builds) -->
+<script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
+<script src="https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/index.js"></script>
+<style>body{background:#07070d}</style>
+</head>
+<body class="text-slate-200 min-h-screen">
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useRef, useEffect } = React;
+
+/* ---------- Constants ---------- */
+const FF_BASE = "https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd";
+const CORE_BASE = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
+const GEMINI_MODEL = "gemini-2.5-flash";
+const W = 1280, H = 720;
+const FALLBACK_QUERIES = ["nature landscape", "space stars", "abstract background"];
+const STEPS = ["Splitting Scenes", "Fetching Videos", "Recording Audio", "Rendering Final Video"];
+
+const ls = {
+  get: (k) => { try { return localStorage.getItem(k) || ""; } catch { return ""; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
+};
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* ---------- 1. Gemini: story -> scenes ---------- */
+async function getScenesFromGemini(story, apiKey) {
+  const prompt =
+    "Split the following story into 4-10 short cinematic scenes for a narrated video. " +
+    "Return ONLY a JSON array. Each item: {\"text\": \"narration (1-2 sentences, in the story's language)\", " +
+    "\"searchQuery\": \"2-4 word ENGLISH stock-video search term\"}.\n\nSTORY:\n" + story;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: "application/json", temperature: 0.7 },
+    }),
+  });
+  if (!res.ok) throw new Error(`Gemini error ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const data = await res.json();
+  let raw = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
+  raw = raw.replace(/```json|```/g, "").trim();
+  const scenes = JSON.parse(raw);
+  if (!Array.isArray(scenes) || !scenes.length) throw new Error("Gemini returned no scenes.");
+  return scenes.filter((s) => s && s.text).map((s) => ({ text: String(s.text), searchQuery: String(s.searchQuery || "nature") }));
+}
+
+/* ---------- 2. Pexels ---------- */
+async function pexelsSearch(query, apiKey) {
+  const res = await fetch(
+    `https://api.pexels.com/videos/search?query=${encodeURIComponent(query)}&per_page=8&orientation=landscape`,
+    { headers: { Authorization: apiKey } }
+  );
+  if (!res.ok) throw new Error(`Pexels error ${res.status} (check your API key)`);
+  const data = await res.json();
+  const vids = (data.videos || []).filter((v) => v.video_files?.length);
+  if (!vids.length) return null;
+  const v = vids[Math.floor(Math.random() * Math.min(vids.length, 3))];
+  const files = v.video_files.filter((f) => f.file_type === "video/mp4" && f.width >= 640 && f.width <= 1920);
+  const pool = files.length ? files : v.video_files.filter((f) => f.file_type === "video/mp4");
+  pool.sort((a, b) => Math.abs(a.width - W) - Math.abs(b.width - W));
+  return pool[0]?.link || null;
+}
+async function fetchPexelsVideo(query, apiKey) {
+  for (const q of [query, ...FALLBACK_QUERIES]) {
+    const link = await pexelsSearch(q, apiKey);
+    if (link) return link;
+  }
+  throw new Error("Pexels returned no videos, even for fallback queries.");
+}
+
+/* ---------- 3. TTS recording ---------- */
+// Browsers cannot export speechSynthesis audio directly. The only client-side way is to capture
+// this tab's audio via getDisplayMedia (user must pick "This tab" and tick "Share tab audio").
+async function openTabAudioStream() {
+  if (!window.speechSynthesis) throw new Error("Speech synthesis is not supported in this browser.");
+  if (!navigator.mediaDevices?.getDisplayMedia || !window.MediaRecorder) return null;
+  try {
+    const s = await navigator.mediaDevices.getDisplayMedia({
+      video: true, audio: true, preferCurrentTab: true, selfBrowserSurface: "include",
+      systemAudio: "include",
+    });
+    if (!s.getAudioTracks().length) { s.getTracks().forEach((t) => t.stop()); return null; }
+    return s;
+  } catch { return null; }
+}
+const estimateDuration = (text) => Math.max(2.5, text.trim().split(/\s+/).length / 2.6);
+
+function speak(text) {
+  return new Promise((resolve) => {
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 1; u.pitch = 1;
+    const done = () => { clearTimeout(t); resolve(); };
+    const t = setTimeout(done, (estimateDuration(text) + 15) * 1000);
+    u.onend = done; u.onerror = done;
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(u);
+  });
+}
+
+async function generateAudioBlob(text, tabStream) {
+  if (!tabStream) { await sleep(50); return { blob: null, duration: estimateDuration(text) }; }
+  const audioOnly = new MediaStream(tabStream.getAudioTracks());
+  const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "";
+  const rec = new MediaRecorder(audioOnly, mime ? { mimeType: mime } : undefined);
+  const chunks = [];
+  rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+  const stopped = new Promise((r) => (rec.onstop = r));
+  rec.start(100);
+  await sleep(250);
+  await speak(text);
+  await sleep(350);
+  rec.stop();
+  await stopped;
+  const blob = new Blob(chunks, { type: rec.mimeType || "audio/webm" });
+  let duration = estimateDuration(text);
+  try {
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    const buf = await ac.decodeAudioData((await blob.arrayBuffer()).slice(0));
+    duration = buf.duration; ac.close();
+  } catch {}
+  return { blob, duration };
+}
+
+/* ---------- 4. FFmpeg ---------- */
+let ffmpegInstance = null;
+async function loadFFmpeg(onLog) {
+  if (ffmpegInstance) return ffmpegInstance;
+  const { FFmpeg } = FFmpegWASM;
+  const { toBlobURL } = FFmpegUtil;
+  const ff = new FFmpeg();
+  ff.on("log", ({ message }) => onLog && onLog(message));
+  await ff.load({
+    classWorkerURL: await toBlobURL(`${FF_BASE}/814.ffmpeg.js`, "text/javascript"),
+    coreURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
+    wasmURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
+  });
+  ffmpegInstance = ff;
+  return ff;
+}
+async function run(ff, args) {
+  const code = await ff.exec(args);
+  if (code !== 0) throw new Error("FFmpeg failed: ffmpeg " + args.join(" ").slice(0, 160));
+}
+
+async function processVideo(assets, musicFile, onProgress) {
+  const { fetchFile } = FFmpegUtil;
+  const ff = await loadFFmpeg();
+  const n = assets.length;
+  const list = [];
+
+  for (let i = 0; i < n; i++) {
+    const a = assets[i];
+    onProgress(`Rendering scene ${i + 1}/${n}…`, i / (n + 1));
+    const vName = `v${i}.mp4`, aName = `a${i}.webm`, out = `scene${i}.mp4`;
+    await ff.writeFile(vName, new Uint8Array(await a.videoBlob.arrayBuffer()));
+    const D = (a.duration + 0.3).toFixed(2);
+    const vf = `scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,fps=30,format=yuv420p`;
+    const audioIn = [];
+    if (a.audioBlob && a.audioBlob.size > 0) {
+      await ff.writeFile(aName, new Uint8Array(await a.audioBlob.arrayBuffer()));
+      audioIn.push("-i", aName);
+    } else {
+      audioIn.push("-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo");
+    }
+    await run(ff, [
+      "-stream_loop", "-1", "-i", vName, ...audioIn,
+      "-map", "0:v:0", "-map", "1:a:0",
+      "-vf", vf, "-af", "aresample=44100,apad",
+      "-t", D,
+      "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+      "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+      out,
+    ]);
+    await ff.deleteFile(vName);
+    try { await ff.deleteFile(aName); } catch {}
+    list.push(`file '${out}'`);
+  }
+
+  onProgress("Merging scenes…", n / (n + 1));
+  await ff.writeFile("list.txt", list.join("\n"));
+  await run(ff, ["-f", "concat", "-safe", "0", "-i", "list.txt", "-c", "copy", "main.mp4"]);
+
+  let finalName = "main.mp4";
+  if (musicFile) {
+    onProgress("Mixing background music…", (n + 0.6) / (n + 1));
+    await ff.writeFile("music.mp3", await fetchFile(musicFile));
+    await run(ff, [
+      "-i", "main.mp4", "-stream_loop", "-1", "-i", "music.mp3",
+      "-filter_complex",
+      "[1:a]volume=0.2[m];[0:a][m]amix=inputs=2:duration=first:dropout_transition=0,volume=2[a]",
+      "-map", "0:v", "-map", "[a]",
+      "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-shortest",
+      "final.mp4",
+    ]);
+    finalName = "final.mp4";
+  }
+  const data = await ff.readFile(finalName);
+  for (let i = 0; i < n; i++) { try { await ff.deleteFile(`scene${i}.mp4`); } catch {} }
+  for (const f of ["list.txt", "main.mp4", "music.mp3", "final.mp4"]) { try { await ff.deleteFile(f); } catch {} }
+  return new Blob([data.buffer], { type: "video/mp4" });
+}
+
+/* ---------- UI ---------- */
+function Field({ label, value, onChange, type = "password", placeholder }) {
+  return (
+    <label className="block">
+      <span className="text-xs uppercase tracking-wider text-slate-400">{label}</span>
+      <input type={type} value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder}
+        className="mt-1 w-full rounded-lg bg-white/5 border border-white/10 px-3 py-2 text-sm focus:outline-none focus:border-violet-500" />
+    </label>
+  );
+}
+
+function App() {
+  const [geminiKey, setGeminiKey] = useState(ls.get("gemini_key"));
+  const [pexelsKey, setPexelsKey] = useState(ls.get("pexels_key"));
+  const [story, setStory] = useState("");
+  const [musicFile, setMusicFile] = useState(null);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [progressMessage, setProgressMessage] = useState("");
+  const [progressPercent, setProgressPercent] = useState(0);
+  const [stepIndex, setStepIndex] = useState(-1);
+  const [finalVideoUrl, setFinalVideoUrl] = useState("");
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  useEffect(() => ls.set("gemini_key", geminiKey), [geminiKey]);
+  useEffect(() => ls.set("pexels_key", pexelsKey), [pexelsKey]);
+
+  const setP = (step, msg, pct) => { setStepIndex(step); setProgressMessage(msg); setProgressPercent(Math.round(pct)); };
+
+  async function handleGenerate() {
+    setError(""); setNotice(""); setFinalVideoUrl("");
+    if (!geminiKey || !pexelsKey) return setError("Please enter both API keys.");
+    if (story.trim().length < 20) return setError("Please write a longer story.");
+    setIsGenerating(true);
+    let tabStream = null;
+    try {
+      // Step 1: scenes
+      setP(0, "Splitting story into scenes with Gemini…", 3);
+      const scenes = await getScenesFromGemini(story, geminiKey);
+
+      // Step 2: videos
+      const assets = scenes.map((s) => ({ ...s }));
+      for (let i = 0; i < assets.length; i++) {
+        setP(1, `Fetching stock video ${i + 1}/${assets.length}: "${assets[i].searchQuery}"`, 10 + (i / assets.length) * 20);
+        const link = await fetchPexelsVideo(assets[i].searchQuery, pexelsKey);
+        const r = await fetch(link);
+        if (!r.ok) throw new Error("Could not download a Pexels video (" + r.status + ").");
+        assets[i].videoBlob = await r.blob();
+      }
+
+      // Step 3: audio
+      setP(2, "Requesting tab-audio capture… choose “This tab” and tick “Share tab audio”.", 32);
+      tabStream = await openTabAudioStream();
+      if (!tabStream) setNotice("Tab audio capture unavailable or declined — the video will be rendered without voiceover (timed to estimated speech length).");
+      for (let i = 0; i < assets.length; i++) {
+        setP(2, `Recording narration ${i + 1}/${assets.length}…`, 35 + (i / assets.length) * 25);
+        const { blob, duration } = await generateAudioBlob(assets[i].text, tabStream);
+        assets[i].audioBlob = blob; assets[i].duration = duration;
+      }
+      if (tabStream) { tabStream.getTracks().forEach((t) => t.stop()); tabStream = null; }
+
+      // Step 4: render
+      setP(3, "Loading FFmpeg (first time downloads ~30MB)…", 62);
+      await loadFFmpeg();
+      const blob = await processVideo(assets, musicFile, (msg, frac) => setP(3, msg, 65 + frac * 33));
+      setFinalVideoUrl(URL.createObjectURL(blob));
+      setP(4, "Done! Your video is ready.", 100);
+    } catch (e) {
+      console.error(e);
+      setError(e.message || String(e));
+    } finally {
+      if (tabStream) tabStream.getTracks().forEach((t) => t.stop());
+      window.speechSynthesis && window.speechSynthesis.cancel();
+      setIsGenerating(false);
+    }
+  }
+
+  return (
+    <div className="max-w-3xl mx-auto px-4 py-10">
+      <header className="text-center mb-8">
+        <h1 className="text-3xl sm:text-4xl font-extrabold bg-gradient-to-r from-violet-400 via-fuchsia-400 to-cyan-300 bg-clip-text text-transparent">
+          Story → Video Generator
+        </h1>
+        <p className="text-slate-400 mt-2 text-sm">Gemini + Pexels + Web Speech + FFmpeg.wasm — 100% in your browser.</p>
+      </header>
+
+      <section className="rounded-2xl border border-white/10 bg-white/[0.03] p-5 space-y-4 shadow-xl">
+        <div className="grid sm:grid-cols-2 gap-3">
+          <Field label="Gemini API Key" value={geminiKey} onChange={setGeminiKey} placeholder="AIza…" />
+          <Field label="Pexels API Key" value={pexelsKey} onChange={setPexelsKey} placeholder="Pexels key" />
+        </div>
+        <label className="block">
+          <span className="text-xs uppercase tracking-wider text-slate-400">Your story</span>
+          <textarea rows={8} value={story} onChange={(e) => setStory(e.target.value)}
+            placeholder="Once upon a time, in a quiet mountain village…"
+            className="mt-1 w-full rounded-lg bg-white/5 border border-white/10 px-3 py-2 text-sm focus:outline-none focus:border-violet-500" />
+        </label>
+        <label className="block">
+          <span className="text-xs uppercase tracking-wider text-slate-400">Background music (MP3, optional)</span>
+          <input type="file" accept="audio/mpeg,.mp3" onChange={(e) => setMusicFile(e.target.files[0] || null)}
+            className="mt-1 block w-full text-sm text-slate-300 file:mr-3 file:rounded-lg file:border-0 file:bg-violet-600 file:px-3 file:py-2 file:text-white hover:file:bg-violet-500" />
+        </label>
+        <button onClick={handleGenerate} disabled={isGenerating}
+          className="w-full rounded-xl py-3 font-semibold text-white bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:opacity-90 disabled:opacity-50">
+          {isGenerating ? "Generating…" : "Generate Video"}
+        </button>
+      </section>
+
+      {(isGenerating || progressPercent > 0) && (
+        <section className="mt-6 rounded-2xl border border-white/10 bg-white/[0.03] p-5">
+          <div className="grid grid-cols-4 gap-2 mb-4">
+            {STEPS.map((s, i) => (
+              <div key={s} className={"text-center text-[11px] sm:text-xs rounded-lg px-1 py-2 border " +
+                (i < stepIndex ? "border-emerald-500/50 text-emerald-300 bg-emerald-500/10"
+                  : i === stepIndex ? "border-violet-500 text-violet-200 bg-violet-500/10 animate-pulse"
+                  : "border-white/10 text-slate-500")}>
+                {i < stepIndex ? "✓ " : ""}{s}
+              </div>
+            ))}
+          </div>
+          <div className="h-2 rounded-full bg-white/10 overflow-hidden">
+            <div className="h-full bg-gradient-to-r from-violet-500 to-cyan-400 transition-all duration-500" style={{ width: progressPercent + "%" }} />
+          </div>
+          <p className="text-sm text-slate-300 mt-3">{progressMessage} <span className="text-slate-500">({progressPercent}%)</span></p>
+        </section>
+      )}
+
+      {notice && <div className="mt-4 rounded-lg border border-amber-500/40 bg-amber-500/10 text-amber-200 text-sm p-3">{notice}</div>}
+      {error && <div className="mt-4 rounded-lg border border-rose-500/40 bg-rose-500/10 text-rose-200 text-sm p-3">⚠ {error}</div>}
+
+      {finalVideoUrl && (
+        <section className="mt-6 rounded-2xl border border-white/10 bg-white/[0.03] p-5">
+          <video src={finalVideoUrl} controls className="w-full rounded-lg bg-black" />
+          <a href={finalVideoUrl} download="story-video.mp4"
+            className="mt-4 block text-center rounded-xl py-3 font-semibold text-white bg-emerald-600 hover:bg-emerald-500">
+            ⬇ Download MP4
+          </a>
+        </section>
+      )}
+
+      <p className="text-center text-xs text-slate-600 mt-8">
+        Tip: run via a local server (e.g. <code>npx serve</code>) in Chrome or Edge for tab-audio capture to work.
+      </p>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
